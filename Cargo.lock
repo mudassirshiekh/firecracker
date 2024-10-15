@@ -976,6 +976,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 
 [[package]]
+name = "mshv-bindings"
+version = "0.3.0"
+source = "git+https://github.com/rust-vmm/mshv?tag=v0.3.0#fda05380ea4c68b807996299d5ffb2854ca6d01d"
+dependencies = [
+ "libc",
+ "num_enum",
+ "serde",
+ "serde_derive",
+ "vmm-sys-util",
+ "zerocopy 0.7.35",
+]
+
+[[package]]
+name = "mshv-ioctls"
+version = "0.3.0"
+source = "git+https://github.com/rust-vmm/mshv?tag=v0.3.0#fda05380ea4c68b807996299d5ffb2854ca6d01d"
+dependencies = [
+ "libc",
+ "mshv-bindings",
+ "thiserror",
+ "vmm-sys-util",
+]
+
+[[package]]
 name = "nix"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1019,6 +1043,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_enum"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e613fc340b2220f734a8595782c551f1250e969d87d3be1ae0579e8d4065179"
+dependencies = [
+ "num_enum_derive",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af1844ef2428cc3e1cb900be36181049ef3d3193c63e43026cfe202983b27a56"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1052,6 +1096,8 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "log",
+ "serde",
+ "thiserror",
  "vfio-bindings 0.2.0",
  "vfio-ioctls",
  "vm-device",
@@ -1575,6 +1621,8 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "log",
+ "mshv-bindings",
+ "mshv-ioctls",
  "thiserror",
  "vfio-bindings 0.4.0",
  "vm-memory",
@@ -1610,8 +1658,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
- "serde_derive",
- "serde_json",
  "thiserror",
  "vfio-ioctls",
  "vm-memory",
