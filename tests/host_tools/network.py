@@ -78,7 +78,7 @@ class SSHConnection:
 
     @retry(
         retry=retry_if_exception_type(ChildProcessError),
-        wait=wait_fixed(0.15),
+        wait=wait_fixed(0.5),
         stop=stop_after_attempt(20),
         reraise=True,
     )
@@ -90,24 +90,33 @@ class SSHConnection:
         We'll keep trying to execute a remote command that can't fail
         (`/bin/true`), until we get a successful (0) exit code.
         """
-        self.check_output("true")
+        self.check_output("true", timeout=10, debug=True)
 
-    def run(self, cmd_string, timeout=None, *, check=False):
-        """Execute the command passed as a string in the ssh context."""
+    def run(self, cmd_string, timeout=None, *, check=False, debug=False):
+        """
+        Execute the command passed as a string in the ssh context.
+
+        If `debug` is set, pass `-vvv` to `ssh`. Note that this will clobber stderr.
+        """
+        command = [
+            "ssh",
+            *self.options,
+            f"{self.user}@{self.host}",
+            cmd_string,
+        ]
+
+        if debug:
+            command.insert(1, "-vvv")
+
         return self._exec(
-            [
-                "ssh",
-                *self.options,
-                f"{self.user}@{self.host}",
-                cmd_string,
-            ],
+            command,
             timeout,
             check=check,
         )
 
-    def check_output(self, cmd_string, timeout=None):
+    def check_output(self, cmd_string, timeout=None, *, debug=False):
         """Same as `run`, but raises an exception on non-zero return code of remote command"""
-        return self.run(cmd_string, timeout, check=True)
+        return self.run(cmd_string, timeout, check=True, debug=debug)
 
     def _exec(self, cmd, timeout=None, check=False):
         """Private function that handles the ssh client invocation."""
@@ -121,7 +130,8 @@ def mac_from_ip(ip_address):
     """Create a MAC address based on the provided IP.
 
     Algorithm:
-    - the first 2 bytes are fixed to 06:00
+    - the first 2 bytes are fixed to 06:00, which is in an LAA range
+      - https://en.wikipedia.org/wiki/MAC_address#Ranges_of_group_and_locally_administered_addresses
     - the next 4 bytes are the IP address
 
     Example of function call:
