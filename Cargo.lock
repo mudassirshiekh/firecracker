@@ -1702,6 +1702,7 @@ version = "0.1.0"
 dependencies = [
  "acpi_tables",
  "aes-gcm",
+ "anyhow",
  "arrayvec",
  "aws-lc-rs",
  "base64",
@@ -1737,6 +1738,7 @@ dependencies = [
  "timerfd",
  "userfaultfd",
  "utils",
+ "uuid",
  "vfio-ioctls",
  "vhost",
  "vm-allocator",
