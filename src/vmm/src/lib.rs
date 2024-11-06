@@ -110,6 +110,8 @@ pub mod utils;
 pub mod vmm_config;
 /// Module with virtual state structs.
 pub mod vstate;
+/// TODO: Module for MSI interrupts
+pub mod interrupt;
 
 use std::collections::HashMap;
 use std::io;
@@ -121,9 +123,17 @@ use std::time::Duration;
 use device_manager::acpi::ACPIDeviceManager;
 use device_manager::resources::ResourceAllocator;
 use devices::acpi::vmgenid::VmGenIdError;
+use devices::pci_segment::PciSegment;
+use devices::virtio::transport::VirtioPciDevice;
+use devices::Bus;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
+use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
+use pci::{DeviceRelocation, PciBarRegionType, PciDevice};
 use seccompiler::BpfProgram;
 use userfaultfd::Uffd;
+use vm_device::interrupt::{InterruptManager, MsiIrqGroupConfig};
+use vm_memory::{GuestAddress, GuestUsize};
+use vm_system_allocator::{AddressAllocator, SystemAllocator};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::terminal::Terminal;
@@ -153,6 +163,7 @@ use crate::vstate::memory::{
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
 pub use crate::vstate::vm::Vm;
+use kvm_bindings::{kvm_irq_routing, kvm_irq_routing_entry as IrqRoutingEntry};
 
 /// Shorthand type for the EventManager flavour used by Firecracker.
 pub type EventManager = BaseEventManager<Arc<Mutex<dyn MutEventSubscriber>>>;
@@ -261,6 +272,8 @@ pub enum VmmError {
     VmmObserverTeardown(vmm_sys_util::errno::Error),
     /// VMGenID error: {0}
     VMGenID(#[from] VmGenIdError),
+    /// Unknown
+    Unknown,
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -324,6 +337,12 @@ pub struct Vmm {
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
     acpi_device_manager: ACPIDeviceManager,
+
+    // PCI-related
+    extra_fd: Option<Arc<Mutex<VmFd>>>,
+    pci_segment: Option<PciSegment>,
+    msi_interrupt_manager: Option<Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>>,
+    allocator: Option<Arc<Mutex<SystemAllocator>>>,
 }
 
 impl Vmm {
@@ -347,7 +366,7 @@ impl Vmm {
         &self,
         device_type: DeviceType,
         device_id: &str,
-    ) -> Option<&Mutex<devices::bus::BusDevice>> {
+    ) -> Option<Arc<Mutex<devices::bus::BusDevice>>> {
         self.mmio_device_manager.get_device(device_type, device_id)
     }
 
@@ -857,6 +876,38 @@ impl Vmm {
     }
 }
 
+// Returns a `Vec<T>` with a size in bytes at least as large as `size_in_bytes`.
+fn vec_with_size_in_bytes<T: Default>(size_in_bytes: usize) -> Vec<T> {
+    let rounded_size = (size_in_bytes + size_of::<T>() - 1) / size_of::<T>();
+    let mut v = Vec::with_capacity(rounded_size);
+    v.resize_with(rounded_size, T::default);
+    v
+}
+
+use std::mem::size_of;
+// The kvm API has many structs that resemble the following `Foo` structure:
+//
+// ```
+// #[repr(C)]
+// struct Foo {
+//    some_data: u32
+//    entries: __IncompleteArrayField<__u32>,
+// }
+// ```
+//
+// In order to allocate such a structure, `size_of::<Foo>()` would be too small because it would not
+// include any space for `entries`. To make the allocation large enough while still being aligned
+// for `Foo`, a `Vec<Foo>` is created. Only the first element of `Vec<Foo>` would actually be used
+// as a `Foo`. The remaining memory in the `Vec<Foo>` is for `entries`, which must be contiguous
+// with `Foo`. This function is used to make the `Vec<Foo>` with enough space for `count` entries.
+/// Helper function to create Vec of specific size.
+pub fn vec_with_array_field<T: Default, F>(count: usize) -> Vec<T> {
+    let element_space = count * size_of::<F>();
+    let vec_size_bytes = size_of::<T>() + element_space;
+    vec_with_size_in_bytes(vec_size_bytes)
+}
+
+
 /// Process the content of the MPIDR_EL1 register in order to be able to pass it to KVM
 ///
 /// The kernel expects to find the four affinity levels of the MPIDR in the first 32 bits of the
@@ -966,5 +1017,139 @@ impl MutEventSubscriber for Vmm {
         if let Err(err) = ops.add(Events::new(&self.vcpus_exit_evt, EventSet::IN)) {
             error!("Failed to register vmm exit event: {}", err);
         }
+    }
+}
+
+struct AddressManager {
+    pub(crate) allocator: Arc<Mutex<SystemAllocator>>,
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) io_bus: Arc<Bus>,
+    pub(crate) mmio_bus: Arc<Bus>,
+    pub(crate) vm: Arc<Mutex<VmFd>>,
+    pci_mmio32_allocators: Vec<Arc<Mutex<AddressAllocator>>>,
+    pci_mmio64_allocators: Vec<Arc<Mutex<AddressAllocator>>>,
+}
+
+// TODO implement this in a more granular way 
+impl DeviceRelocation for AddressManager {
+    fn move_bar(
+        &self,
+        old_base: u64,
+        new_base: u64,
+        len: u64,
+        pci_dev: &mut dyn PciDevice,
+        region_type: PciBarRegionType,
+    ) -> std::result::Result<(), std::io::Error> {
+        match region_type {
+            PciBarRegionType::IoRegion => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // Update system allocator
+                    self.allocator
+                        .lock()
+                        .unwrap()
+                        .free_io_addresses(GuestAddress(old_base), len as GuestUsize);
+
+                    self.allocator
+                        .lock()
+                        .unwrap()
+                        .allocate_io_addresses(
+                            Some(GuestAddress(new_base)),
+                            len as GuestUsize,
+                            None,
+                        )
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::Other, "failed allocating new IO range")
+                        })?;
+
+                    // Update PIO bus
+                    self.io_bus
+                        .update_range(old_base, len, new_base, len)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                }
+                #[cfg(target_arch = "aarch64")]
+                error!("I/O region is not supported");
+            }
+            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
+                let allocators = self.pci_mmio32_allocators
+                    .iter()
+                    .chain(self.pci_mmio64_allocators.iter());
+
+                // Find the specific allocator that this BAR was allocated from and use it for new one
+                for allocator in allocators.clone() {
+                    let allocator_base = allocator.lock().unwrap().base();
+                    let allocator_end = allocator.lock().unwrap().end();
+
+                    if old_base >= allocator_base.0 && old_base <= allocator_end.0 {
+                        allocator
+                            .lock()
+                            .unwrap()
+                            .free(GuestAddress(old_base), len as GuestUsize);
+                        break;
+                    }
+                }
+
+                for allocator in allocators {
+                    let allocator_base = allocator.lock().unwrap().base();
+                    let allocator_end = allocator.lock().unwrap().end();
+
+                    if new_base >= allocator_base.0 && new_base <= allocator_end.0 {
+                        allocator
+                            .lock()
+                            .unwrap()
+                            .allocate(Some(GuestAddress(new_base)), len as GuestUsize, Some(len))
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::Other,
+                                    "failed allocating new MMIO range",
+                                )
+                            })?;
+
+                        break;
+                    }
+                }
+
+                // Update MMIO bus
+                self.mmio_bus
+                    .update_range(old_base, len, new_base, len)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            }
+        }
+
+        let any_dev = pci_dev.as_any();
+        if let Some(virtio_pci_dev) = any_dev.downcast_ref::<VirtioPciDevice>() {
+            let bar_addr = virtio_pci_dev.config_bar_addr();
+            if bar_addr == new_base {
+                const NOTIFICATION_BAR_OFFSET: u64 = 0x6000;
+                const NOTIFY_OFF_MULTIPLIER: u32 = 4; // A dword per notification address.
+
+                let old_notify_base = old_base + NOTIFICATION_BAR_OFFSET;
+                for (i, queue_evt) in virtio_pci_dev.virtio_device().lock().unwrap().queue_events().iter().enumerate() {
+                    let addr = old_notify_base + i as u64 * u64::from(NOTIFY_OFF_MULTIPLIER);
+                    let io_addr = IoEventAddress::Mmio(addr);
+                    self.vm.lock().unwrap().unregister_ioevent(queue_evt, &io_addr, NoDatamatch).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("failed to unregister ioevent: {e:?}"),
+                        )
+                    })?;
+                }
+                let new_notify_base = new_base + NOTIFICATION_BAR_OFFSET;
+                for (i, queue_evt) in virtio_pci_dev.virtio_device().lock().unwrap().queue_events().iter().enumerate() {
+                    let addr = new_notify_base + i as u64 * u64::from(NOTIFY_OFF_MULTIPLIER);
+                    let io_addr = IoEventAddress::Mmio(addr);
+                    self.vm.lock().unwrap()
+                        .register_ioevent(queue_evt, &io_addr, NoDatamatch)
+                        .map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("failed to register ioevent: {e:?}"),
+                            )
+                        })?;                
+                }
+            } 
+        }
+
+        pci_dev.move_bar(old_base, new_base)
     }
 }

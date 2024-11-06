@@ -22,20 +22,20 @@ use vm_allocator::AllocPolicy;
 use super::resources::ResourceAllocator;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::DeviceInfoForFDT;
-use crate::arch::DeviceType;
+use crate::arch::{self, DeviceType};
 use crate::arch::DeviceType::Virtio;
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::RTCDevice;
 use crate::devices::pseudo::BootTimer;
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::block::device::Block;
-use crate::devices::virtio::device::VirtioDevice;
-use crate::devices::virtio::mmio::MmioTransport;
+use crate::devices::virtio::device::{VirtioDevice, VirtioInterruptType};
+use crate::devices::virtio::transport::MmioTransport;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend, TYPE_VSOCK};
 use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_NET, TYPE_RNG};
-use crate::devices::BusDevice;
+use crate::devices::{BusDevice, BusError};
 #[cfg(target_arch = "x86_64")]
 use crate::vstate::memory::GuestAddress;
 
@@ -121,6 +121,7 @@ fn add_virtio_aml(
 #[derive(Debug)]
 pub struct MMIODeviceManager {
     pub(crate) bus: crate::devices::Bus,
+    pci_bus: Option<Arc<Mutex<BusDevice>>>,
     pub(crate) id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
     // We create the AML byte code for every VirtIO device in the order we build
     // it, so that we ensure the root block device is appears first in the DSDT.
@@ -137,6 +138,7 @@ impl MMIODeviceManager {
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
     pub fn new() -> MMIODeviceManager {
         MMIODeviceManager {
+            pci_bus: None,
             bus: crate::devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
             #[cfg(target_arch = "x86_64")]
@@ -161,6 +163,19 @@ impl MMIODeviceManager {
             irqs,
         };
         Ok(device_info)
+    }
+
+    /// Register the PCI bus.
+    pub fn register_pci_bus(&mut self, pci_bus: Arc<Mutex<BusDevice>>) -> Result<(), MmioError> {
+        self.bus
+            .insert(
+                Arc::clone(&pci_bus),
+                arch::PCI_MMCONFIG_START,
+                arch::PCI_MMCONFIG_SIZE,
+            )
+            .map_err(MmioError::BusInsert)?;
+        self.pci_bus = Some(pci_bus);
+        Ok(())
     }
 
     /// Register a device at some MMIO address.
@@ -202,7 +217,9 @@ impl MMIODeviceManager {
                     .map_err(MmioError::RegisterIoEvent)?;
             }
             vm.register_irqfd(
-                &locked_device.interrupt_trigger().irq_evt,
+                &locked_device.interrupt()
+                    .notifier(VirtioInterruptType::Queue(0))
+                    .expect("mmio device should have evenfd"),
                 device_info.irqs[0],
             )
             .map_err(MmioError::RegisterIrqFd)?;
@@ -367,12 +384,12 @@ impl MMIODeviceManager {
         &self,
         device_type: DeviceType,
         device_id: &str,
-    ) -> Option<&Mutex<BusDevice>> {
+    ) -> Option<Arc<Mutex<BusDevice>>> {
         if let Some(device_info) = self
             .id_to_dev_info
             .get(&(device_type, device_id.to_string()))
         {
-            if let Some((_, device)) = self.bus.get_device(device_info.addr) {
+            if let Some((_, _, device)) = self.bus.get_device(device_info.addr) {
                 return Some(device);
             }
         }
@@ -382,7 +399,7 @@ impl MMIODeviceManager {
     /// Run fn for each registered device.
     pub fn for_each_device<F, E: Debug>(&self, mut f: F) -> Result<(), E>
     where
-        F: FnMut(&DeviceType, &String, &MMIODeviceInfo, &Mutex<BusDevice>) -> Result<(), E>,
+        F: FnMut(&DeviceType, &String, &MMIODeviceInfo, Arc<Mutex<BusDevice>>) -> Result<(), E>,
     {
         for ((device_type, device_id), device_info) in self.get_device_info().iter() {
             let bus_device = self
@@ -502,7 +519,8 @@ impl MMIODeviceManager {
                             .unwrap();
                         if vsock.is_activated() {
                             info!("kick vsock {id}.");
-                            vsock.signal_used_queue().unwrap();
+                            // TODO should we kick rx as well?
+                            vsock.signal_used_queue(1).unwrap();
                         }
                     }
                     TYPE_RNG => {
@@ -540,7 +558,7 @@ mod tests {
     use vmm_sys_util::eventfd::EventFd;
 
     use super::*;
-    use crate::devices::virtio::device::{IrqTrigger, VirtioDevice};
+    use crate::devices::virtio::device::{IrqTrigger, VirtioDevice, VirtioInterrupt};
     use crate::devices::virtio::queue::Queue;
     use crate::devices::virtio::ActivateError;
     use crate::test_utils::multi_region_mem;
@@ -587,7 +605,7 @@ mod tests {
         dummy: u32,
         queues: Vec<Queue>,
         queue_evts: [EventFd; 1],
-        interrupt_trigger: IrqTrigger,
+        interrupt: Arc<IrqTrigger>,
     }
 
     impl DummyDevice {
@@ -596,7 +614,7 @@ mod tests {
                 dummy: 0,
                 queues: QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect(),
                 queue_evts: [EventFd::new(libc::EFD_NONBLOCK).expect("cannot create eventFD")],
-                interrupt_trigger: IrqTrigger::new().expect("cannot create eventFD"),
+                interrupt: Arc::new(IrqTrigger::new().expect("cannot create eventFD")),
             }
         }
     }
@@ -628,8 +646,8 @@ mod tests {
             &self.queue_evts
         }
 
-        fn interrupt_trigger(&self) -> &IrqTrigger {
-            &self.interrupt_trigger
+        fn interrupt(&self) -> Arc<dyn VirtioInterrupt> {
+            self.interrupt.clone()
         }
 
         fn ack_features_by_page(&mut self, page: u32, value: u32) {
@@ -647,7 +665,7 @@ mod tests {
             let _ = data;
         }
 
-        fn activate(&mut self, _: GuestMemoryMmap) -> Result<(), ActivateError> {
+        fn activate(&mut self, _: GuestMemoryMmap, _: Option<Arc<dyn VirtioInterrupt>>) -> Result<(), ActivateError> {
             Ok(())
         }
 
@@ -661,7 +679,7 @@ mod tests {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
         let guest_mem = multi_region_mem(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]);
-        let mut vm = Vm::new(vec![]).unwrap();
+        let (mut vm, _) = Vm::new(vec![]).unwrap();
         vm.memory_init(&guest_mem, false).unwrap();
         let mut device_manager = MMIODeviceManager::new();
         let mut resource_allocator = ResourceAllocator::new().unwrap();
@@ -690,7 +708,7 @@ mod tests {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
         let guest_mem = multi_region_mem(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]);
-        let mut vm = Vm::new(vec![]).unwrap();
+        let (mut vm, _) = Vm::new(vec![]).unwrap();
         vm.memory_init(&guest_mem, false).unwrap();
         let mut device_manager = MMIODeviceManager::new();
         let mut resource_allocator = ResourceAllocator::new().unwrap();
@@ -744,7 +762,7 @@ mod tests {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
         let guest_mem = multi_region_mem(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]);
-        let mut vm = Vm::new(vec![]).unwrap();
+        let (mut vm, _) = Vm::new(vec![]).unwrap();
         vm.memory_init(&guest_mem, false).unwrap();
 
         let mem_clone = guest_mem.clone();
