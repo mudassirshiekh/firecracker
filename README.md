@@ -10,6 +10,7 @@ container and function workloads.
 Read more about the Firecracker Charter [here](CHARTER.md).
 
 ## What is Firecracker?
+## By Mudassir Alam
 
 Firecracker is an open source virtualization technology that is purpose-built
 for creating and managing secure, multi-tenant container and function-based
